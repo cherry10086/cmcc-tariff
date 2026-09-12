@@ -58,6 +58,16 @@ const KNOWN_FIELDS = [
   '超出资费说明', '其他服务内容', '其他说明',
 ];
 
+// 判定「校园相关」业务的关键词，供报告里的「排除校园相关」开关过滤。
+// 别往里加「动感地带」「青春」这类青年品牌名 —— 它们不全是校园业务，会误伤。
+const CAMPUS_RE = /校园|高校|学校|学生|学籍|新生/;
+
+// 「校园」在源站文本里有两种相反的语境：「校园用户」（说明本业务面向谁）和
+// 「政企/校园宽带不适用此活动」（排除条款，只出现在通用业务里）。后者一并命中就是误伤 ——
+// 实测广东「家庭宽带惠民提速至100M服务包」的适用范围就写着「政企/校园/功能等宽带属于
+// 非家庭宽带，不适用此活动」，它本身是家用业务。所以逐句判定，带否定语气的句子直接跳过。
+const CAMPUS_NEG_RE = /不适用|除外|不含|不包括|不属于/;
+
 // 各阶段等待时长（毫秒）。加密网关响应慢，给足时间比事后重试划算。
 const WAIT = {
   firstPaint: 8000,   // 首屏 SPA 初始化
@@ -677,6 +687,34 @@ function persistProvince(cfg, province, items, quietTabs, coverage) {
 
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+/**
+ * 取资费标准里的数值（"0元/次" → 0，"15.9元/月" → 15.9），取不到返回空串。
+ * 报告搜索框靠它做价格精确匹配 —— 纯子串匹配下「0元」会被「10元」「100元」污染。
+ *
+ * 取的是第一个数字：源站把原价写在最前、优惠说明塞进括号（「15元/月（首2月7.5元/月…）」），
+ * 所以首数字就是主价格。已知边界（实测 15068 条里有 20 条）：区间价「0—70元/月」按下限 0 参与
+ * 匹配，「220一次性」这类非元单位的也会取出数字。量小且在语义边缘 —— 要精确得先定义区间算哪头，
+ * 那是另一个问题，不值得为 0.1% 的条目把规则堆起来。
+ */
+function priceValue(price) {
+  const m = String(price || '').match(/\d+(?:\.\d+)?/);
+  return m ? String(parseFloat(m[0])) : '';
+}
+
+/**
+ * 是否「校园相关」业务：名称命中，或者适用范围里正向描述的目标客户命中。
+ *
+ * 只看名称 + 适用范围两处：其余字段误伤率高 ——「适用范围」是描述目标客户的地方，
+ * 判断「本业务面向谁」最准；而「其他说明」这类长文本和资源表里出现的校园只是局部提及
+ * （如资源写「1000M（河北校园300M)」的宽带套餐），拿它们做排除会把通用业务一起干掉。
+ */
+function isCampus(r) {
+  if (CAMPUS_RE.test(r.name || '')) return true;
+  return String(r.scope || '')
+    .split(/[。；;！!？?\n]/)                       // 按句切，逗号不切 —— 否定词常与校园词同句
+    .some((s) => CAMPUS_RE.test(s) && !CAMPUS_NEG_RE.test(s));
+}
+
 /** 终端表格。完整字段看 HTML/JSON。 */
 function renderConsole(items, province, cfg, quietTabs = []) {
   const cols = [
@@ -730,7 +768,8 @@ function renderHTML(items, province, meta) {
     const long = [['超出资费说明', r.overage], ['其他服务内容', r.extraService], ['其他说明', r.extraNote]]
       .filter(([, v]) => v).map(([k, v]) => `<details><summary>${esc(k)}</summary><p>${esc(v)}</p></details>`).join('');
 
-    return `<article class="card${r.isNew ? ' is-new' : ''}" data-name="${esc((r.name + ' ' + r.code + ' ' + r.price).toLowerCase())}">
+    // data-price 存纯数值供搜索框做价格精确匹配；data-campus 供「排除校园相关」开关过滤。
+    return `<article class="card${r.isNew ? ' is-new' : ''}" data-name="${esc((r.name + ' ' + r.code + ' ' + r.price).toLowerCase())}" data-price="${priceValue(r.price)}" data-campus="${isCampus(r) ? 1 : 0}">
       <div class="date-col">
         <div class="date">${esc(r.onlineDate || '未知')}</div>
         <div class="rel">${esc(relativeDays(parseCnDate(r.onlineRaw)))}</div>
@@ -762,6 +801,9 @@ function renderHTML(items, province, meta) {
   .stat .hot{color:var(--new);font-weight:700}
   #q{margin-top:12px;width:100%;max-width:420px;padding:8px 12px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--fg);font-size:14px;outline:none}
   #q:focus{border-color:var(--accent)}
+  .chk{margin-top:10px;display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:13px;cursor:pointer;user-select:none}
+  .chk input{margin:0;accent-color:var(--accent);cursor:pointer}
+  .chk:hover{color:var(--fg)}
   main{max-width:1180px;margin:0 auto;padding:20px 28px 80px}
   .sect{margin:26px 0 12px;font-size:13px;color:var(--dim);letter-spacing:1px;border-bottom:1px solid var(--line);padding-bottom:8px}
   .sect.new-sect{color:var(--new);border-color:var(--new)}
@@ -794,7 +836,8 @@ function renderHTML(items, province, meta) {
 <header>
   <h1>中国移动 · ${esc(province)}资费公示专区</h1>
   <div class="stat">按<b>上线日期</b>倒序 · 共 <b>${items.length}</b> 条业务 ${meta.newCount ? `· 本次新增 <span class="hot">${meta.newCount}</span> 条` : '· 无新增'}${futures.length ? ` · 另有 ${futures.length} 条预约上线已置底` : ''} · 抓取于 ${esc(stamp)}</div>
-  <input id="q" placeholder="筛选业务名 / 方案编号 / 资费…">
+  <input id="q" placeholder="筛选业务名 / 方案编号 / 资费（输入 0元 精确匹配价格）">
+  <label class="chk"><input type="checkbox" id="no-campus">排除校园相关</label>
   ${(meta.quietTabs || []).length ? `<div class="notice">该地区未公示以下业务，源站无数据（非抓取遗漏）：<br>${meta.quietTabs.map((c) => `· ${esc(c.category)} + ${esc(c.rangeTab)}`).join('<br>')}</div>` : ''}
 </header>
 <main>
@@ -806,16 +849,38 @@ ${futures.length ? `<div class="sect">预约上线（生效日期在未来，${f
 </main>
 <script>
   const q = document.getElementById('q'), none = document.getElementById('none');
-  const cards = [...document.querySelectorAll('.card')];
-  q.addEventListener('input', () => {
-    const k = q.value.trim().toLowerCase(); let shown = 0;
+  const noCampus = document.getElementById('no-campus');
+  const cards = [...document.querySelectorAll('.card')], sects = [...document.querySelectorAll('.sect')];
+  // 输入是「价格词」时改走数值精确匹配 —— 子串匹配下 0元 会连 10元、100元 一起捞出来。
+  // 下面这段整体是模板字符串，正则里的反斜杠必须写成 \\：单写 \d 会被模板字符串吃成 d，
+  // 到了页面上就是 /^(d+...)s*元/ 这样的废正则，筛选静默失效（踩过一次）。
+  const PRICE_Q = /^(\\d+(?:\\.\\d+)?)\\s*元(?:\\s*\\/?\\s*(?:月|次|天|年|人|户))?$/;
+
+  function applyFilter() {
+    const k = q.value.trim().toLowerCase();
+    const pm = k.match(PRICE_Q);
+    let shown = 0;
     for (const c of cards) {
-      const hit = !k || c.dataset.name.includes(k);
+      let hit = pm
+        ? c.dataset.price !== '' && Number(c.dataset.price) === parseFloat(pm[1])
+        : (!k || c.dataset.name.includes(k));
+      if (hit && noCampus.checked && c.dataset.campus === '1') hit = false; // 排除校园是叠加条件
       c.style.display = hit ? '' : 'none';
       if (hit) shown++;
     }
+    // 区块内的卡片被过滤光时连标题一起收起，免得出现「标题写着 N 条、下面一片空白」。
+    for (const s of sects) {
+      let p = s.nextElementSibling, any = false;
+      while (p && !p.classList.contains('sect')) {
+        if (p.classList.contains('card') && p.style.display !== 'none') { any = true; break; }
+        p = p.nextElementSibling;
+      }
+      s.style.display = any ? '' : 'none';
+    }
     none.style.display = shown ? 'none' : 'block';
-  });
+  }
+  q.addEventListener('input', applyFilter);
+  noCampus.addEventListener('change', applyFilter);
 </script>
 </body></html>`;
 }
