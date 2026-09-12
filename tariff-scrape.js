@@ -34,6 +34,9 @@ const SELECTORS = {
   provItem: '.select-item',            // 省份列表项
   categoryTab: '.tab-item',            // 业务分类页签（个人资费 / 政企资费）
   rangeTab: '.range-tab',              // 归属页签（全网资费 / 本省资费）
+  typeBox: '.line-3 .select-container .select-box',      // 资费类型下拉的触发区
+  typeList: '.line-3 .select-list-box .select-item',     // 资费类型下拉的选项
+  typeText: '.line-3 .select-container .tipsText',       // 资费类型当前值（用于核对是否切换成功）
   card: '.tariff-item-container',      // 业务卡片根节点
   cardName: '.item-name',              // 业务名称
   tips: '.item-tips-list',             // 字段明细块
@@ -41,6 +44,11 @@ const SELECTORS = {
   rowTitle: '.row-title',
   rowContent: '.row-content',
 };
+
+// 资费类型。页面默认只显示「套餐」，其余三类全被挡在外面 ——
+// 实测北京全网资费：套餐 43 条、加装包 1420 条、港澳台/国际资费 1318 条、
+// 营销活动 13 条。只抓默认的那一档会漏掉 98% 的数据。
+const TARIFF_TYPES = ['套餐', '加装包', '营销活动', '港澳台/国际资费'];
 
 // 字段标签白名单：只有命中它的行才当作新字段起点，其余视为上一字段的续行
 // （「其他说明」这类值本身跨多行，且值内可能含冒号）。
@@ -55,8 +63,10 @@ const WAIT = {
   firstPaint: 8000,   // 首屏 SPA 初始化
   provPanel: 1200,    // 省份弹层展开
   provSwitch: 6000,   // 切省后重新拉数
-  tabSwitch: 3000,    // 切页签后重新拉数
+  tabSwitch: 3000,    // 切页签 / 切资费类型后重新拉数
   settle: 1000,       // 每次滚动触发后的加载等待
+  dropdown: 700,      // 资费类型下拉的展开动画
+  cardRender: 3000,   // 切页签后的渲染冷却：接口慢，立刻开始判定会把「还没开始加载」误判成「已加载完」
 };
 
 // 连续多少轮「卡片数不增、且在途请求为 0、且累计请求数不变」才认定加载结束。
@@ -167,6 +177,7 @@ function parseArgs(argv) {
     provinces: [],       // 目标省份
     categories: [],      // 空 = 全部（个人资费 + 政企资费）
     scopes: [],          // 空 = 全部（全网资费 + 本省资费）
+    tariffTypes: [],     // 空 = 全部四种资费类型
     outDir: path.join(__dirname, 'data'),
     top: 0,              // 终端打印条数上限，0 = 全部
     json: true, html: true, snapshot: true, open: true,
@@ -179,6 +190,7 @@ function parseArgs(argv) {
       case '-p': case '--province': cfg.provinces.push(next()); break;
       case '--category': cfg.categories.push(next()); break;
       case '--scope': cfg.scopes.push(next()); break;
+      case '--type': cfg.tariffTypes.push(next()); break;
       case '--out': cfg.outDir = path.resolve(next()); break;
       case '--top': cfg.top = parseInt(next(), 10) || 0; break;
       case '--no-json': cfg.json = false; break;
@@ -270,6 +282,66 @@ async function readTabs(page) {
  * 实测重复点击已激活的页签不会改变加载结果（有对照实验），这里只是为了
  * 省掉无谓的等待：没点击就不用 sleep，每个省少等几秒。
  */
+/**
+ * 切换「资费类型」下拉。
+ *
+ * 页面把资费类型做成了自定义下拉（不是原生 select），默认停在「套餐」，
+ * 另外三类完全不可见。必须点开下拉再选具体项，点完还要核对当前值 ——
+ * 下拉有时会点空，不核对就会把上一轮的数据当成新类型的抓回去。
+ */
+async function selectTariffType(page, label) {
+  const opened = await page.evaluate((sel) => {
+    const box = document.querySelector(sel);
+    if (box) { box.click(); return true; }
+    return false;
+  }, SELECTORS.typeBox);
+  if (!opened) return false;
+
+  await sleep(WAIT.dropdown);
+  const clicked = await page.evaluate((sel, lb) => {
+    const el = [...document.querySelectorAll(sel)].find((e) => (e.innerText || '').trim() === lb);
+    if (el) { el.click(); return true; }
+    return false;
+  }, SELECTORS.typeList, label);
+  if (!clicked) return false;
+
+  await sleep(WAIT.tabSwitch);
+  // 核对确实切过去了，否则宁可报失败也不要抓成上一类型的数据
+  const current = await page.evaluate((sel) => {
+    const t = document.querySelector(sel);
+    return t ? (t.innerText || '').trim() : '';
+  }, SELECTORS.typeText);
+  return current === label;
+}
+
+/**
+ * 读取当前分类下「资费类型」下拉的实际选项。
+ *
+ * 必须动态读，不能写死：个人资费有四种类型，政企资费只有「加装包」一种。
+ * 早先按固定四种去切，政企下每次都找不到目标项而被整段跳过。
+ */
+async function readTariffTypes(page) {
+  const opened = await page.evaluate((sel) => {
+    const box = document.querySelector(sel);
+    if (box) { box.click(); return true; }
+    return false;
+  }, SELECTORS.typeBox);
+  if (!opened) return [];
+
+  await sleep(WAIT.dropdown);
+  const options = await page.evaluate((sel) =>
+    [...document.querySelectorAll(sel)].map((e) => (e.innerText || '').trim()).filter(Boolean),
+    SELECTORS.typeList);
+
+  // 收回下拉，避免遮挡后续点击
+  await page.evaluate((sel) => {
+    const box = document.querySelector(sel);
+    if (box) box.click();
+  }, SELECTORS.typeBox);
+  await sleep(400);
+  return options;
+}
+
 async function clickTab(page, selector, label) {
   const state = await page.evaluate((sel, lb) => {
     const el = [...document.querySelectorAll(sel)].find((e) => (e.innerText || '').trim() === lb);
@@ -404,6 +476,7 @@ async function scrapeCards(page, meta) {
         resources: extractResources(card),
         category: meta.category,   // 个人资费 / 政企资费
         rangeTab: meta.rangeTab,   // 全网资费 / 本省资费
+        tariffType: meta.tariffType, // 套餐 / 加装包 / 营销活动 / 港澳台·国际资费
       };
     }).filter((r) => r.name || r.code);
   }, SELECTORS, KNOWN_FIELDS, meta);
@@ -418,39 +491,51 @@ async function scrapeProvince(page, province, cfg) {
   const ranges = cfg.scopes.length
     ? tabs.ranges.filter((r) => cfg.scopes.some((s) => (s === '本省' ? !r.includes('全网') : r.includes('全网'))))
     : tabs.ranges;
+  const types = cfg.tariffTypes.length ? TARIFF_TYPES.filter((t) => cfg.tariffTypes.includes(t)) : TARIFF_TYPES;
   log(`  分类页签: ${cats.join(' / ')}   归属页签: ${ranges.join(' / ')}`);
 
   const all = [];
   const coverage = [];
   for (const cat of cats) {
     if (!(await clickTab(page, SELECTORS.categoryTab, cat))) { logWarn(`未找到分类页签「${cat}」，跳过`); continue; }
+
+    // 资费类型的可选项随分类变化，必须在切完分类之后再读
+    const available = await readTariffTypes(page);
+    const catTypes = types.filter((t) => available.includes(t));
+    log(`  ── ${cat}：资费类型可选 ${available.join(' / ') || '(未读到)'}`);
+    if (!catTypes.length) { logWarn(`${cat}: 没有匹配的资费类型，跳过`); continue; }
+
     for (const range of ranges) {
       if (!(await clickTab(page, SELECTORS.rangeTab, range))) { logWarn(`未找到页签「${range}」，跳过`); continue; }
-      const callsBefore = await page.evaluate(() => window.__LIST_CALLS__ || 0).catch(() => 0);
-      const cards = await loadAllCards(page);
-      const callsAfter = await page.evaluate(() => window.__LIST_CALLS__ || 0).catch(() => 0);
-      const rows = await scrapeCards(page, { category: cat, rangeTab: range });
+      for (const type of catTypes) {
+        if (!(await selectTariffType(page, type))) { logWarn(`未找到资费类型「${type}」，跳过`); continue; }
+        const callsBefore = await page.evaluate(() => window.__LIST_CALLS__ || 0).catch(() => 0);
+        const cards = await loadAllCards(page);
+        const callsAfter = await page.evaluate(() => window.__LIST_CALLS__ || 0).catch(() => 0);
+        const rows = await scrapeCards(page, { category: cat, rangeTab: range, tariffType: type });
 
-      // 0 条 + 全程没发过列表请求 = 源站对该组合走「不请求直接不渲染」分支。
-      // 实测 11 个省的「政企资费 + 本省资费」全是这个行为，且前端源码里压根没有
-      // 「暂无数据」这类文案 —— 判定为源站对空数据的正常处理，而非抓取故障。
-      // 仍如实标出，供人工复核，不替使用者下结论。
-      const quiet = rows.length === 0 && callsAfter === callsBefore;
-      coverage.push({ category: cat, rangeTab: range, cards, parsed: rows.length, quiet });
-      log(`  [${cat} · ${range}] 卡片 ${cards} 张 → 解析 ${rows.length} 条${quiet ? '  · 源站无数据（该地区未公示此类业务）' : ''}`);
-      all.push(...rows);
+        // 0 条 + 全程没发过列表请求 = 源站对该组合走「不请求直接不渲染」分支。
+        // 实测 11 个省的「政企资费 + 本省资费」全是这个行为，且前端源码里压根没有
+        // 「暂无数据」这类文案 —— 判定为源站对空数据的正常处理，而非抓取故障。
+        // 仍如实标出，供人工复核，不替使用者下结论。
+        const quiet = rows.length === 0 && callsAfter === callsBefore;
+        coverage.push({ category: cat, rangeTab: range, tariffType: type, cards, parsed: rows.length, quiet });
+        log(`  [${cat} · ${range} · ${type}] 卡片 ${cards} 张 → 解析 ${rows.length} 条${quiet ? '  · 源站无数据' : ''}`);
+        all.push(...rows);
+      }
     }
   }
 
-  // 同一方案编号可能同时出现在「全网资费」与「本省资费」，按编号合并，保留全部归属标签
+  // 同一方案编号可能同时出现在多个页签或类型下，按编号合并，保留全部归属标签与类型
   const byCode = new Map();
   for (const r of all) {
     const key = r.code || `${r.name}|${r.price}`;
     const hit = byCode.get(key);
-    if (!hit) byCode.set(key, { ...r, categories: [r.category], rangeTabs: [r.rangeTab] });
+    if (!hit) byCode.set(key, { ...r, categories: [r.category], rangeTabs: [r.rangeTab], tariffTypes: [r.tariffType] });
     else {
       if (!hit.categories.includes(r.category)) hit.categories.push(r.category);
       if (!hit.rangeTabs.includes(r.rangeTab)) hit.rangeTabs.push(r.rangeTab);
+      if (!hit.tariffTypes.includes(r.tariffType)) hit.tariffTypes.push(r.tariffType);
     }
   }
   return { province, selected: true, items: [...byCode.values()], coverage };
@@ -572,7 +657,7 @@ function persistProvince(cfg, province, items, quietTabs, coverage) {
     fs.writeFileSync(jf, JSON.stringify({
       province, scrapedAt: new Date().toISOString(), total: itemsFinal.length,
       newThisRun: newCount, firstRun, coverage,
-      quietTabs: quietTabs.map((c) => `${c.category} + ${c.rangeTab}`),
+      quietTabs: quietTabs.map((c) => `${c.category} + ${c.rangeTab} + ${c.tariffType}`),
       items: itemsFinal,
     }, null, 2), 'utf8');
     logOk(`JSON → ${jf}`);
@@ -596,10 +681,11 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<
 function renderConsole(items, province, cfg, quietTabs = []) {
   const cols = [
     { key: '上线日期', w: 12, get: (r) => (r.onlineDate || r.onlineRaw || '未知') + (r.isFuture ? '*' : '') },
-    { key: '业务名称', w: 40, get: (r) => r.name },
+    { key: '业务名称', w: 36, get: (r) => r.name },
     { key: '方案编号', w: 12, get: (r) => r.code },
-    { key: '资费标准', w: 16, get: (r) => r.price },
-    { key: '归属', w: 20, get: (r) => (r.rangeTabs || []).join('+') },
+    { key: '资费标准', w: 14, get: (r) => r.price },
+    { key: '类型', w: 12, get: (r) => (r.tariffTypes || [r.tariffType]).filter(Boolean).join('+') },
+    { key: '归属', w: 14, get: (r) => (r.rangeTabs || [r.rangeTab]).filter(Boolean).join('+') },
   ];
   const sep = '+' + cols.map((c) => '-'.repeat(c.w + 2)).join('+') + '+';
   const row = (cells) => '| ' + cells.map((c, i) => padDisp(c, cols[i].w) + ' ').join('|') + '|';
@@ -617,7 +703,7 @@ function renderConsole(items, province, cfg, quietTabs = []) {
   out.push('★NEW = 相比上次抓取新上线   * = 生效日期在未来（预约业务，已置底）');
   if (quietTabs.length) {
     out.push('', `· 以下 ${quietTabs.length} 个页签组合该地区未公示，源站无数据（非抓取遗漏）：`);
-    for (const c of quietTabs) out.push(`    ${c.category} + ${c.rangeTab}`);
+    for (const c of quietTabs) out.push(`    ${c.category} + ${c.rangeTab} + ${c.tariffType}`);
   }
   return out.join('\n');
 }
@@ -630,9 +716,9 @@ function renderHTML(items, province, meta) {
 
   const card = (r) => {
     const tags = [
-      ...(r.categories || []).map((c) => `<span class="tag">${esc(c)}</span>`),
-      ...(r.rangeTabs || []).map((c) => `<span class="tag tag-alt">${esc(c)}</span>`),
-      r.tariffType ? `<span class="tag tag-dim">${esc(r.tariffType)}</span>` : '',
+      ...(r.categories || [r.category]).map((c) => `<span class="tag">${esc(c)}</span>`),
+      ...(r.rangeTabs || [r.rangeTab]).map((c) => `<span class="tag tag-alt">${esc(c)}</span>`),
+      ...(r.tariffTypes || [r.tariffType]).filter(Boolean).map((t) => `<span class="tag tag-dim">${esc(t)}</span>`),
       r.isFuture ? '<span class="tag tag-future">预约上线</span>' : '',
     ].join('');
     const res = (r.resources || []).map((x) => `<div class="res"><span>${esc(x.label)}</span><b>${esc(x.value)}</b></div>`).join('');
@@ -830,6 +916,9 @@ const HELP = `中国移动资费公示专区 · 抓取指定省份全部业务�
   -p, --province <名>     省份名，可多次（须与页面一致，如 北京市 / 广西）
   --category <名>         只抓指定分类（个人资费 / 政企资费），可多次
   --scope <全网|本省>     只抓指定归属页签，可多次
+  --type <名>             只抓指定资费类型（套餐 / 加装包 / 营销活动 / 港澳台国际资费），
+                          可多次；默认全部四种。页面本身只显示「套餐」，
+                          不去要其余三类会漏掉 98% 的数据
   --out <目录>            输出目录（默认 ./data）
   --top <n>               终端只打印前 n 条（默认全部；HTML/JSON 始终完整）
   --no-json / --no-html   不导出对应文件
