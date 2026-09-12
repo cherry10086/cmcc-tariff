@@ -1,0 +1,17 @@
+{
+  "name": "cmcc-tariff",
+  "version": "1.0.0",
+  "description": "中国移动资费公示专区全量业务抓取 · 按上线日期倒序",
+  "main": "tariff-scrape.js",
+  "scripts": {
+    "start": "node tariff-scrape.js",
+    "list": "node tariff-scrape.js --list-provinces"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.10.0"
+  },
+  "license": "MIT"
+}

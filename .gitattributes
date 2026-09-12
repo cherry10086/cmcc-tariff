@@ -1,0 +1,8 @@
+# 统一以 LF 存储，避免 Windows / Linux 协作时产生无意义的换行符差异
+* text=auto eol=lf
+
+# 二进制文件不做换行符转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
