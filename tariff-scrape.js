@@ -62,7 +62,12 @@ const WAIT = {
 // 连续多少轮「卡片数不增、且在途请求为 0、且累计请求数不变」才认定加载结束。
 // 调大只是多等几秒；调小则可能把还没吐完的数据当成全部 —— 江西曾把 182 条抓成 5 条。
 const STABLE_ROUNDS = 8;
-const MAX_ROUNDS = 120;
+
+// 滚动轮数上限。它只是防止无限空转的安全阀，正常情况下靠「连续 8 轮稳定」提前退出。
+// 这个值必须留足余量：实测山东 661 条要滚到第 88 轮才加载完，按同比例换算，
+// 两千条量级的大省需要 200 轮以上 —— 上限设低了会在数据到齐前强行收工。
+const MAX_ROUNDS = 400;
+const PROGRESS_EVERY = 25; // 每多少轮报一次进度，免得长时间加载看起来像卡死
 
 // ════════════════ 基础工具 ════════════════
 
@@ -323,6 +328,8 @@ async function loadAllCards(page) {
     }
     if (process.env.DEBUG_ROLL) {
       log(`      轮${String(round).padStart(2)} 卡片=${String(probe.cards).padStart(3)} 在途=${probe.pending} 稳定=${stable}`);
+    } else if (round > 0 && round % PROGRESS_EVERY === 0) {
+      log(`      …滚动 ${round} 轮，已见 ${probe.cards} 条`);
     }
     await sleep(WAIT.settle);
   }
