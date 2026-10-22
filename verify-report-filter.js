@@ -96,6 +96,55 @@ function check(label, actual, expected) {
     const expectSub = items.filter((i) => `${i.name} ${i.code} ${i.price}`.toLowerCase().includes('套餐')).length;
     check('搜「套餐」可见卡片数', await count(), expectSub);
 
+    const setQ = (v) => page.$eval('#q', (el, val) => { el.value = val; el.dispatchEvent(new Event('input')); }, v);
+    /** 与页面同一口径：priceValue → 数值；空串（未解析出价格）返回 null。 */
+    const priceNum = (i) => { const v = api.priceValue(i.price); return v === '' ? null : parseFloat(v); };
+
+    console.log('\n【价格上限：≤30元 / <30元 / 30元以下 三种写法等效】');
+    const expectLE30 = items.filter((i) => { const v = priceNum(i); return v !== null && v <= 30; }).length;
+    await setQ('≤30元');
+    check('搜「≤30元」可见卡片数', await count(), expectLE30);
+    await setQ('<30元');
+    check('搜「<30元」可见卡片数', await count(), expectLE30);
+    await setQ('30元以下');
+    check('搜「30元以下」可见卡片数', await count(), expectLE30);
+
+    console.log('\n【价格区间：10-30元；反序 30-10元 等效】');
+    const expectRange = items.filter((i) => { const v = priceNum(i); return v !== null && v >= 10 && v <= 30; }).length;
+    await setQ('10-30元');
+    check('搜「10-30元」可见卡片数', await count(), expectRange);
+    await setQ('30-10元');
+    check('搜「30-10元」（反序）可见卡片数', await count(), expectRange);
+
+    console.log('\n【多词 AND：两个词都要命中】');
+    const expectAnd = items.filter((i) => {
+      const s = `${i.name} ${i.code} ${i.price}`.toLowerCase();
+      return s.includes('宽带') && s.includes('1000');
+    }).length;
+    await setQ('宽带 1000');
+    check('搜「宽带 1000」可见卡片数', await count(), expectAnd);
+
+    console.log('\n【词 + 价格混用：宽带 ≤30元】');
+    const expectMix = items.filter((i) => {
+      const s = `${i.name} ${i.code} ${i.price}`.toLowerCase();
+      const v = priceNum(i);
+      return s.includes('宽带') && v !== null && v <= 30;
+    }).length;
+    await setQ('宽带 ≤30元');
+    check('搜「宽带 ≤30元」可见卡片数', await count(), expectMix);
+
+    console.log('\n【价格上限叠加排除校园】');
+    const expectLE30NoCampus = items.filter((i) => { const v = priceNum(i); return v !== null && v <= 30 && !api.isCampus(i); }).length;
+    await setQ('≤30元');
+    await page.click('#no-campus');
+    check('「≤30元」+ 排除校园 可见卡片数', await count(), expectLE30NoCampus);
+    await page.click('#no-campus'); // 复原勾选状态，交给后续用例
+
+    console.log('\n【无价格卡片不参与价格类筛选】');
+    const expectAllPriced = items.filter((i) => { const v = priceNum(i); return v !== null && v <= 99999; }).length;
+    await setQ('≤99999元');
+    check('搜「≤99999元」可见卡片数（= 有价格的全部）', await count(), expectAllPriced);
+
     console.log('\n【搜不到东西时给提示，而不是白屏】');
     await page.$eval('#q', (el) => { el.value = ''; el.dispatchEvent(new Event('input')); });
     await page.type('#q', '这个词不存在xyz');

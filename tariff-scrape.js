@@ -191,7 +191,7 @@ function parseArgs(argv) {
     outDir: path.join(__dirname, 'data'),
     top: 0,              // 终端打印条数上限，0 = 全部
     json: true, html: true, snapshot: true, open: true,
-    headful: false, listProvinces: false, overviewOnly: false, help: false,
+    headful: false, listProvinces: false, overviewOnly: false, renderOnly: false, help: false,
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -208,6 +208,7 @@ function parseArgs(argv) {
       case '--no-snapshot': cfg.snapshot = false; break;
       case '--no-open': cfg.open = false; break;
       case '--overview': cfg.overviewOnly = true; break;
+      case '--render-only': cfg.renderOnly = true; break;
       case '--headful': cfg.headful = true; break;
       case '--list-provinces': cfg.listProvinces = true; break;
       case '-h': case '--help': cfg.help = true; break;
@@ -292,14 +293,29 @@ async function readTabs(page) {
  * 实测重复点击已激活的页签不会改变加载结果（有对照实验），这里只是为了
  * 省掉无谓的等待：没点击就不用 sleep，每个省少等几秒。
  */
+/** 读取资费类型下拉的当前显示值。读不到时返回空串。 */
+async function readTypeText(page) {
+  return page.evaluate((sel) => {
+    const t = document.querySelector(sel);
+    return t ? (t.innerText || '').trim() : '';
+  }, SELECTORS.typeText);
+}
+
 /**
  * 切换「资费类型」下拉。
  *
  * 页面把资费类型做成了自定义下拉（不是原生 select），默认停在「套餐」，
  * 另外三类完全不可见。必须点开下拉再选具体项，点完还要核对当前值 ——
  * 下拉有时会点空，不核对就会把上一轮的数据当成新类型的抓回去。
+ *
+ * 例外：当前显示值已等于目标时直接放行，不点击。实测证据（2026-10-11 探针）：
+ *   切归属页签后本下拉会自行重置为「套餐」并自动重新拉数，且显示值、卡片内
+ *   「资费类型」标注、实际数据三者一致；而点击已激活项反而会触发一次多余的
+ *   重新拉取。所以这里跳过点击 —— 省下点开、重选、3 秒等待与一次冗余请求。
  */
 async function selectTariffType(page, label) {
+  if ((await readTypeText(page)) === label) return true;
+
   const opened = await page.evaluate((sel) => {
     const box = document.querySelector(sel);
     if (box) { box.click(); return true; }
@@ -317,11 +333,7 @@ async function selectTariffType(page, label) {
 
   await sleep(WAIT.tabSwitch);
   // 核对确实切过去了，否则宁可报失败也不要抓成上一类型的数据
-  const current = await page.evaluate((sel) => {
-    const t = document.querySelector(sel);
-    return t ? (t.innerText || '').trim() : '';
-  }, SELECTORS.typeText);
-  return current === label;
+  return (await readTypeText(page)) === label;
 }
 
 /**
@@ -470,7 +482,6 @@ async function scrapeCards(page, meta) {
         name,
         code: pick('方案编号'),
         price: pick('资费标准').replace(/\s+/g, ' '),
-        tariffType: pick('资费类型'),
         scope: pick('适用范围'),
         region: pick('适用地区'),
         channel: pick('销售渠道'),
@@ -484,6 +495,7 @@ async function scrapeCards(page, meta) {
         extraService: pick('其他服务内容'),
         extraNote: pick('其他说明'),
         resources: extractResources(card),
+        // 以下三项统一取遍历维度（meta）而非卡片文本：脚本实际点选筛选的依据就是它
         category: meta.category,   // 个人资费 / 政企资费
         rangeTab: meta.rangeTab,   // 全网资费 / 本省资费
         tariffType: meta.tariffType, // 套餐 / 加装包 / 营销活动 / 港澳台·国际资费
@@ -836,7 +848,7 @@ function renderHTML(items, province, meta) {
 <header>
   <h1>中国移动 · ${esc(province)}资费公示专区</h1>
   <div class="stat">按<b>上线日期</b>倒序 · 共 <b>${items.length}</b> 条业务 ${meta.newCount ? `· 本次新增 <span class="hot">${meta.newCount}</span> 条` : '· 无新增'}${futures.length ? ` · 另有 ${futures.length} 条预约上线已置底` : ''} · 抓取于 ${esc(stamp)}</div>
-  <input id="q" placeholder="筛选业务名 / 方案编号 / 资费（输入 0元 精确匹配价格）">
+  <input id="q" placeholder="筛选：关键词（空格组合）· 价格 0元 / ≤30元 / 10-30元">
   <label class="chk"><input type="checkbox" id="no-campus">排除校园相关</label>
   ${(meta.quietTabs || []).length ? `<div class="notice">该地区未公示以下业务，源站无数据（非抓取遗漏）：<br>${meta.quietTabs.map((c) => `· ${esc(c.category)} + ${esc(c.rangeTab)}`).join('<br>')}</div>` : ''}
 </header>
@@ -851,19 +863,38 @@ ${futures.length ? `<div class="sect">预约上线（生效日期在未来，${f
   const q = document.getElementById('q'), none = document.getElementById('none');
   const noCampus = document.getElementById('no-campus');
   const cards = [...document.querySelectorAll('.card')], sects = [...document.querySelectorAll('.sect')];
-  // 输入是「价格词」时改走数值精确匹配 —— 子串匹配下 0元 会连 10元、100元 一起捞出来。
+  // 输入按空白切成词，逐词给出判定函数，全部命中才显示（AND）——「宽带 1000」这类组合词可用。
+  // 价格类词走数值比较而非子串：子串下搜「0元」会把 10元、100元 全捞出来。
+  // 三种价格写法：0元（精确）、≤30元 / <30元 / 30元以下（上限）、10-30元（区间），可与普通词混用。
   // 下面这段整体是模板字符串，正则里的反斜杠必须写成 \\：单写 \d 会被模板字符串吃成 d，
   // 到了页面上就是 /^(d+...)s*元/ 这样的废正则，筛选静默失效（踩过一次）。
-  const PRICE_Q = /^(\\d+(?:\\.\\d+)?)\\s*元(?:\\s*\\/?\\s*(?:月|次|天|年|人|户))?$/;
+  const PRICE_EQ = /^(\\d+(?:\\.\\d+)?)\\s*元(?:\\s*\\/?\\s*(?:月|次|天|年|人|户))?$/;
+  const PRICE_LE = /^(?:<=|≤|<)\\s*(\\d+(?:\\.\\d+)?)\\s*元(?:\\s*\\/?\\s*(?:月|次|天|年|人|户))?$/;
+  const PRICE_BELOW = /^(\\d+(?:\\.\\d+)?)\\s*元(?:以内|以下|内)$/;
+  const PRICE_RANGE = /^(\\d+(?:\\.\\d+)?)\\s*[-~～—－至]\\s*(\\d+(?:\\.\\d+)?)\\s*元(?:\\s*\\/?\\s*(?:月|次|天|年|人|户))?$/;
+
+  /** data-price 是纯数值；未解析出价格的卡片（空串）返回 null，不参与价格类筛选。 */
+  const priceOf = (c) => (c.dataset.price !== '' ? Number(c.dataset.price) : null);
+
+  /** 单个词 → 判定函数：价格表达式走数值比较，其余走子串匹配。 */
+  function wordCond(w) {
+    const eq = w.match(PRICE_EQ), le = w.match(PRICE_LE), bl = w.match(PRICE_BELOW), rg = w.match(PRICE_RANGE);
+    if (eq) return (c) => { const p = priceOf(c); return p !== null && p === parseFloat(eq[1]); };
+    if (le) return (c) => { const p = priceOf(c); return p !== null && p <= parseFloat(le[1]); };
+    if (bl) return (c) => { const p = priceOf(c); return p !== null && p <= parseFloat(bl[1]); };
+    if (rg) {
+      const a = parseFloat(rg[1]), b = parseFloat(rg[2]);
+      return (c) => { const p = priceOf(c); return p !== null && p >= Math.min(a, b) && p <= Math.max(a, b); };
+    }
+    return (c) => c.dataset.name.includes(w);
+  }
 
   function applyFilter() {
     const k = q.value.trim().toLowerCase();
-    const pm = k.match(PRICE_Q);
+    const conds = k ? k.split(/\\s+/).filter(Boolean).map(wordCond) : [];
     let shown = 0;
     for (const c of cards) {
-      let hit = pm
-        ? c.dataset.price !== '' && Number(c.dataset.price) === parseFloat(pm[1])
-        : (!k || c.dataset.name.includes(k));
+      let hit = !conds.length || conds.every((f) => f(c));
       if (hit && noCampus.checked && c.dataset.campus === '1') hit = false; // 排除校园是叠加条件
       c.style.display = hit ? '' : 'none';
       if (hit) shown++;
@@ -976,6 +1007,7 @@ const HELP = `中国移动资费公示专区 · 抓取指定省份全部业务�
   node tariff-scrape.js -p 北京市                抓北京：全网资费 + 北京资费
   node tariff-scrape.js -p 江苏省 -p 上海市      抓多个省
   node tariff-scrape.js --overview              把已有数据汇总成全国总览（不联网）
+  node tariff-scrape.js --render-only -p 广东省  从已有数据重新渲染报告（不抓取）
 
 选项:
   -p, --province <名>     省份名，可多次（须与页面一致，如 北京市 / 广西）
@@ -992,6 +1024,7 @@ const HELP = `中国移动资费公示专区 · 抓取指定省份全部业务�
   --headful               显示浏览器窗口（调试用）
   --list-provinces        列出省份后退出
   --overview              只汇总已有数据出全国总览，不抓取
+  --render-only           从已有 <省>-data.json 重新渲染报告，不抓取（需 -p 指定省份）
   -h, --help              帮助
 
 输出:
@@ -1016,6 +1049,26 @@ async function runOnce(cfg) {
     fs.writeFileSync(of, renderOverview(list), 'utf8');
     logOk(`全国总览 → ${of}（汇总 ${list.length} 个省）`);
     if (cfg.open) openPath(of);
+    return;
+  }
+
+  // 重新渲染：从已有 <省>-data.json 重建报告，不抓取、不联网。
+  // 改过渲染层（样式 / 搜索逻辑）后想立刻看到新报告，不必重抓一遍。
+  // 注意：isFuture 等按「今天」重算，报告始终反映当前视角；isNew 沿用抓取时算好的值。
+  if (cfg.renderOnly) {
+    if (!cfg.provinces.length) { logWarn('--render-only 需要 -p <省名>（可多个）'); return; }
+    for (const prov of cfg.provinces) {
+      const jf = path.join(cfg.outDir, `${prov}-data.json`);
+      if (!fs.existsSync(jf)) { logWarn(`${prov}: 未找到 ${jf}，先跑一次抓取`); continue; }
+      let raw;
+      try { raw = JSON.parse(fs.readFileSync(jf, 'utf8')); }
+      catch (e) { logWarn(`${prov}: JSON 解析失败（${e.message}）`); continue; }
+      const items = sortByOnlineDate(enrich(raw.items || []));
+      const hf = path.join(cfg.outDir, `${prov}-report.html`);
+      fs.writeFileSync(hf, renderHTML(items, prov, { newCount: raw.newThisRun || 0, quietTabs: (raw.coverage || []).filter((c) => c.quiet) }), 'utf8');
+      logOk(`${prov}: 报告已重新渲染 → ${hf}（${items.length} 条）`);
+      if (cfg.open) openPath(hf);
+    }
     return;
   }
 
@@ -1060,7 +1113,7 @@ async function runOnce(cfg) {
 (async () => {
   const cfg = parseArgs(process.argv);
   if (cfg.help) { log(HELP); return; }
-  if (!cfg.listProvinces && !cfg.overviewOnly && !cfg.provinces.length) {
+  if (!cfg.listProvinces && !cfg.overviewOnly && !cfg.renderOnly && !cfg.provinces.length) {
     log('缺少 --province。先跑 `node tariff-scrape.js --list-provinces` 查省份名。\n');
     log(HELP);
     return;
