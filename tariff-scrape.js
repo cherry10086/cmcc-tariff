@@ -157,7 +157,8 @@ function parseCnDate(raw) {
   const m = String(raw || '').match(/(\d{4})\s*[年\-/.]\s*(\d{1,2})\s*[月\-/.]\s*(\d{1,2})/);
   if (!m) return null;
   const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  return Number.isNaN(d.getTime()) ? null : d;
+  return d.getFullYear() === Number(m[1]) && d.getMonth() === Number(m[2]) - 1
+    && d.getDate() === Number(m[3]) ? d : null;
 }
 
 /** Date → "2026-02-09" */
@@ -234,9 +235,10 @@ async function openPage(browser) {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     window.__LIST_CALLS__ = 0;
     window.__LIST_PENDING__ = 0;
+    window.__LIST_FAILED__ = 0;
     const oOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (m, u, ...r) {
-      if (typeof u === 'string' && /getTariffListInfo/.test(u)) this.__isList = true;
+      this.__isList = typeof u === 'string' && /getTariffListInfo/.test(u);
       return oOpen.call(this, m, u, ...r);
     };
     const oSend = XMLHttpRequest.prototype.send;
@@ -244,7 +246,10 @@ async function openPage(browser) {
       if (this.__isList) {
         window.__LIST_CALLS__++;
         window.__LIST_PENDING__++;
-        this.addEventListener('loadend', () => { window.__LIST_PENDING__--; });
+        this.addEventListener('loadend', () => {
+          window.__LIST_PENDING__--;
+          if (this.status === 0 || this.status >= 400) window.__LIST_FAILED__++;
+        }, { once: true });
       }
       return oSend.apply(this, a);
     };
@@ -396,7 +401,7 @@ async function clickTab(page, selector, label) {
 async function loadAllCards(page) {
   await sleep(WAIT.cardRender); // 切页签后先让数据有机会起步，再谈「有没有加载完」
   await page.mouse.move(720, 600).catch(() => {});
-  let prev = -1, stable = 0;
+  let prev = -1, stable = 0, complete = false;
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     await page.keyboard.press('End').catch(() => {});
@@ -411,11 +416,14 @@ async function loadAllCards(page) {
       return {
         cards: document.querySelectorAll(sel).length,
         pending: window.__LIST_PENDING__ || 0,
+        failed: window.__LIST_FAILED__ || 0,
       };
     }, SELECTORS.card);
 
+    if (probe.failed > 0) throw new Error('列表请求失败，无法确认数据完整');
+
     if (probe.cards === prev && probe.pending === 0) {
-      if (++stable >= STABLE_ROUNDS) break;
+      if (++stable >= STABLE_ROUNDS) { complete = true; break; }
     } else {
       stable = 0;
       prev = probe.cards;
@@ -429,6 +437,7 @@ async function loadAllCards(page) {
   }
 
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  if (!complete) throw new Error('达到滚动上限仍未稳定，无法确认数据完整');
   return Math.max(prev, 0);
 }
 
@@ -506,6 +515,7 @@ async function scrapeCards(page, meta) {
 
 /** 抓取一个省份：遍历 分类页签 × 归属页签。 */
 async function scrapeProvince(page, province, cfg) {
+  await page.evaluate(() => { window.__LIST_FAILED__ = 0; });
   if (!(await selectProvince(page, province))) return { province, selected: false, items: [], coverage: [] };
 
   const tabs = await readTabs(page);
@@ -514,23 +524,26 @@ async function scrapeProvince(page, province, cfg) {
     ? tabs.ranges.filter((r) => cfg.scopes.some((s) => (s === '本省' ? !r.includes('全网') : r.includes('全网'))))
     : tabs.ranges;
   const types = cfg.tariffTypes.length ? TARIFF_TYPES.filter((t) => cfg.tariffTypes.includes(t)) : TARIFF_TYPES;
+  if (!cats.length || !ranges.length || !types.length) throw new Error('未读取到匹配的分类、归属页签或资费类型');
+  if (cfg.scopes.some((s) => !['本省', '全网'].includes(s))) throw new Error('未知归属页签范围，请使用本省或全网');
   log(`  分类页签: ${cats.join(' / ')}   归属页签: ${ranges.join(' / ')}`);
 
   const all = [];
   const coverage = [];
   for (const cat of cats) {
-    if (!(await clickTab(page, SELECTORS.categoryTab, cat))) { logWarn(`未找到分类页签「${cat}」，跳过`); continue; }
+    if (!(await clickTab(page, SELECTORS.categoryTab, cat))) throw new Error(`未找到分类页签「${cat}」`);
 
     // 资费类型的可选项随分类变化，必须在切完分类之后再读
     const available = await readTariffTypes(page);
+    if (!available.length) throw new Error(`${cat}: 未读取到资费类型下拉选项`);
     const catTypes = types.filter((t) => available.includes(t));
     log(`  ── ${cat}：资费类型可选 ${available.join(' / ') || '(未读到)'}`);
     if (!catTypes.length) { logWarn(`${cat}: 没有匹配的资费类型，跳过`); continue; }
 
     for (const range of ranges) {
-      if (!(await clickTab(page, SELECTORS.rangeTab, range))) { logWarn(`未找到页签「${range}」，跳过`); continue; }
+      if (!(await clickTab(page, SELECTORS.rangeTab, range))) throw new Error(`未找到页签「${range}」`);
       for (const type of catTypes) {
-        if (!(await selectTariffType(page, type))) { logWarn(`未找到资费类型「${type}」，跳过`); continue; }
+        if (!(await selectTariffType(page, type))) throw new Error(`未能选中资费类型「${type}」`);
         const callsBefore = await page.evaluate(() => window.__LIST_CALLS__ || 0).catch(() => 0);
         const cards = await loadAllCards(page);
         const callsAfter = await page.evaluate(() => window.__LIST_CALLS__ || 0).catch(() => 0);
@@ -547,6 +560,8 @@ async function scrapeProvince(page, province, cfg) {
       }
     }
   }
+
+  if (!coverage.length) throw new Error('没有完成任何匹配的资费组合，保留已有报告');
 
   // 同一方案编号可能同时出现在多个页签或类型下，按编号合并，保留全部归属标签与类型
   const byCode = new Map();
@@ -612,7 +627,8 @@ function loadSnapshot(file) {
   if (!fs.existsSync(file)) return { ok: true, data: null, reason: 'absent' };
   try {
     const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!data || typeof data !== 'object' || !data.items) return { ok: false, reason: 'malformed' };
+    if (!data || typeof data !== 'object' || !data.items
+      || typeof data.items !== 'object' || Array.isArray(data.items)) return { ok: false, reason: 'malformed' };
     return { ok: true, data, reason: 'ok' };
   } catch (e) {
     return { ok: false, reason: String(e.code || 'parse-error') };
@@ -650,7 +666,7 @@ function persistProvince(cfg, province, items, quietTabs, coverage) {
 
   if (cfg.snapshot) {
     const loaded = loadSnapshot(snapFile);
-    const partial = !!(cfg.categories.length || cfg.scopes.length);
+    const partial = !!(cfg.categories.length || cfg.scopes.length || cfg.tariffTypes.length);
     if (!loaded.ok) logWarn(`${province}: 快照读取失败（${loaded.reason}），本次跳过写入以免破坏基线`);
 
     const d = diffSnapshot(items, loaded.ok ? loaded.data : null);
@@ -1092,7 +1108,7 @@ async function runOnce(cfg) {
       logStep(`[${i + 1}/${cfg.provinces.length}] 抓取 ${prov} …`);
       try {
         const raw = await scrapeProvince(page, prov, cfg);
-        if (!raw.selected) { logWarn(`${prov}: 未能选中该省，请用 --list-provinces 核对名称`); continue; }
+        if (!raw.selected) { logWarn(`${prov}: 未能选中该省，请用 --list-provinces 核对名称`); process.exitCode = 1; continue; }
         const items = sortByOnlineDate(enrich(raw.items));
         const quietTabs = raw.coverage.filter((c) => c.quiet);
         logOk(`${prov}: 解析到 ${items.length} 条业务${quietTabs.length ? `（${quietTabs.length} 个组合源站无数据）` : ''}`);
@@ -1101,6 +1117,7 @@ async function runOnce(cfg) {
         // 单省失败不该带走整批。页面可能卡在异常状态（弹窗、路由错乱），
         // 重载一次把状态冲干净，否则后面每个省都会跟着失败。
         logWarn(`${prov}: 抓取失败（${e.message}），重载页面后继续`);
+        process.exitCode = 1;
         try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }); await sleep(WAIT.firstPaint); }
         catch (e2) { logWarn(`页面重载也失败（${e2.message}）`); }
       }
